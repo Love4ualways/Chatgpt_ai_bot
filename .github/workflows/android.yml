@@ -1,0 +1,263 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # --------------------------------------------------
+      # 1. Checkout repository
+      # --------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------
+      # 2. Automatically find and unzip latest v4/v5/etc.
+      # --------------------------------------------------
+      - name: Find and unzip latest monitor ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=========================================="
+          echo "Searching for Alpha Chain Monitor ZIP..."
+          echo "=========================================="
+
+          mapfile -d '' ZIP_FILES < <(
+            find . \
+              -type f \
+              -iname 'alpha-chain-monitor-android*.zip' \
+              -print0 |
+            sort -z -V
+          )
+
+          if [ "${#ZIP_FILES[@]}" -eq 0 ]; then
+            echo ""
+            echo "ERROR: No Alpha Chain Monitor ZIP was found!"
+            echo ""
+            echo "ZIP files currently in repository:"
+            find . -type f -iname '*.zip' -print || true
+            exit 1
+          fi
+
+          echo ""
+          echo "Available Alpha Chain Monitor ZIP files:"
+
+          for ZIP in "${ZIP_FILES[@]}"; do
+            echo "  $ZIP"
+          done
+
+          # Automatically select newest version
+          ZIP_FILE="${ZIP_FILES[${#ZIP_FILES[@]}-1]}"
+
+          echo ""
+          echo "=========================================="
+          echo "Using:"
+          echo "$ZIP_FILE"
+          echo "=========================================="
+
+          rm -rf extracted
+          mkdir -p extracted
+
+          unzip -oq "$ZIP_FILE" -d extracted
+
+          echo ""
+          echo "=========================================="
+          echo "Extracted contents:"
+          echo "=========================================="
+
+          find extracted -maxdepth 5 -type f | sort
+
+      # --------------------------------------------------
+      # 3. Find Flutter project
+      # --------------------------------------------------
+      - name: Locate Flutter project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR=""
+
+          # Case 1:
+          # pubspec.yaml directly inside extracted/
+          if [ -f "extracted/pubspec.yaml" ]; then
+            PROJECT_DIR="extracted"
+          else
+
+            # Case 2:
+            # ZIP contains an extra folder
+            PUBSPEC=$(
+              find extracted \
+                -mindepth 1 \
+                -maxdepth 5 \
+                -type f \
+                -name 'pubspec.yaml' \
+                -print -quit
+            )
+
+            if [ -z "$PUBSPEC" ]; then
+              echo ""
+              echo "ERROR: pubspec.yaml was not found!"
+              echo ""
+              echo "Extracted files:"
+              find extracted -maxdepth 5 -type f | sort
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$PUBSPEC")"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "Flutter project found:"
+          echo "$PROJECT_DIR"
+          echo "=========================================="
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      # --------------------------------------------------
+      # 4. Install Flutter
+      # --------------------------------------------------
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.35.0"
+          cache: true
+
+      # --------------------------------------------------
+      # 5. Generate COMPLETE Android project
+      # --------------------------------------------------
+      - name: Generate Android Gradle project
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo ""
+          echo "=========================================="
+          echo "Generating Android project..."
+          echo "=========================================="
+
+          # Remove any incomplete Android folder
+          rm -rf android
+
+          # Generate a fresh Android project
+          flutter create \
+            --platforms=android \
+            --project-name=alpha_chain_monitor \
+            .
+
+          echo ""
+          echo "Checking Android Gradle files..."
+
+          if [ -f "android/settings.gradle" ]; then
+            echo "Found android/settings.gradle"
+          elif [ -f "android/settings.gradle.kts" ]; then
+            echo "Found android/settings.gradle.kts"
+          else
+            echo "ERROR: Android settings.gradle was not generated!"
+            exit 1
+          fi
+
+          if [ -f "android/app/build.gradle" ]; then
+            echo "Found android/app/build.gradle"
+          elif [ -f "android/app/build.gradle.kts" ]; then
+            echo "Found android/app/build.gradle.kts"
+          else
+            echo "ERROR: Android app Gradle file was not generated!"
+            exit 1
+          fi
+
+          echo ""
+          echo "Android Gradle project generated successfully."
+
+      # --------------------------------------------------
+      # 6. Install Flutter dependencies
+      # --------------------------------------------------
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Installing Flutter dependencies..."
+
+          flutter pub get
+
+      # --------------------------------------------------
+      # 7. Analyze Dart code
+      # --------------------------------------------------
+      - name: Analyze Flutter project
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Running Flutter analyzer..."
+
+          flutter analyze
+
+      # --------------------------------------------------
+      # 8. Build APK
+      # --------------------------------------------------
+      - name: Build release APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo ""
+          echo "=========================================="
+          echo "Building release APK..."
+          echo "=========================================="
+
+          flutter build apk --release
+
+      # --------------------------------------------------
+      # 9. Verify APK
+      # --------------------------------------------------
+      - name: Verify APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+
+          echo ""
+          echo "Checking APK..."
+
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: APK was not created!"
+            echo ""
+            echo "Available build files:"
+            find build -type f | sort || true
+            exit 1
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "APK BUILD SUCCESSFUL"
+          echo "=========================================="
+
+          ls -lh "$APK"
+
+      # --------------------------------------------------
+      # 10. Upload APK to GitHub Actions
+      # --------------------------------------------------
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: alpha-chain-monitor-apk
+          path: ${{ env.PROJECT_DIR }}/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
